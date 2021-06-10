@@ -7,9 +7,9 @@ namespace TxBalancer
     internal static class Program
     {
         public static readonly Uri AmqpUri = new Uri("amqp://guest:guest@localhost:5672/");
-        public static readonly string InputQueueName = "input";
-        public static readonly string ResponseQueueName = "response";
-        public static readonly Func<int, string> OutputQueueName = i => $"output_{i}";
+        public static readonly string InputQueueName = "_tx_balancer_input";
+        public static readonly string ResponseQueueName = "_tx_balancer_response";
+        public static readonly Func<int, string> OutputQueueName = i => $"_tx_balancer_output_{i}";
         public static readonly Func<int, string> OutputMirrorQueueName = i => $"{OutputQueueName(i)}.mirror";
 
         public static async Task Main()
@@ -45,7 +45,7 @@ namespace TxBalancer
                 new Publisher(
                     connection,
                     1000,
-                    1024
+                    16 * 1024
                 ).Start();
 
                 Console.ReadKey();
