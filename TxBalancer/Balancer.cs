@@ -21,6 +21,7 @@ namespace TxBalancer
         private readonly ushort _inputPrefetchCount;
         private IModel _outputModel;
         private IModel _inputModel;
+        private IModel _publishModel;
 
         public Balancer(IConnection connection, ushort queueCount, ushort queueSizeLimit, ushort outputPrefetchCount,
             ushort inputPrefetchCount)
@@ -40,7 +41,9 @@ namespace TxBalancer
 
             _inputModel = _connection.CreateModel();
             _inputModel.BasicQos(0, _inputPrefetchCount, false);
-            _inputModel.TxSelect();
+
+            _publishModel = _connection.CreateModel();
+            _publishModel.TxSelect();
 
             DeclareResources();
 
@@ -136,10 +139,10 @@ namespace TxBalancer
 
                 OnMessageProcessing();
 
-                await RabbitMqUtils.InTransaction(_inputModel, model =>
-                {
-                    model.BasicAck(deliveryTag, false);
+                _inputModel.BasicAck(deliveryTag, false);
 
+                await RabbitMqUtils.InTransaction(_publishModel, model =>
+                {
                     var properties = model.CreateBasicProperties();
                     properties.MessageId = messageId;
                     properties.Persistent = true;
@@ -149,7 +152,7 @@ namespace TxBalancer
                     properties.MessageId = messageId;
                     properties.Persistent = true;
                     model.BasicPublish("", Program.OutputMirrorQueueName((int) outputQueueIndex), properties,
-                        args.Body);
+                        Array.Empty<byte>());
                 });
             };
             _inputModel.BasicConsume(consumer, Program.InputQueueName);
@@ -166,7 +169,7 @@ namespace TxBalancer
         private void OnMessageProcessed()
         {
             Interlocked.Decrement(ref _processingMessages);
-            if (Interlocked.Increment(ref _processedMessages) % 10000 == 0)
+            if (Interlocked.Increment(ref _processedMessages) % 1000 == 0)
             {
                 Console.WriteLine($"[Balancer] Processed {_processedMessages} messages");
             }

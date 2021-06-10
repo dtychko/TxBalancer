@@ -6,49 +6,70 @@ namespace TxBalancer
 {
     internal static class Program
     {
-        public static readonly Uri AmqpUri = new Uri("amqp://guest:guest@localhost:5672/");
+        public static Uri AmqpUri = new Uri("amqp://guest:guest@localhost:5672/");
         public static readonly string InputQueueName = "_tx_balancer_input";
         public static readonly string ResponseQueueName = "_tx_balancer_response";
         public static readonly Func<int, string> OutputQueueName = i => $"_tx_balancer_output_{i}";
         public static readonly Func<int, string> OutputMirrorQueueName = i => $"{OutputQueueName(i)}.mirror";
 
-        public static async Task Main()
+        public static async Task Main(string[] args)
         {
+            const ushort queueCount = 3;
+            const ushort queueSizeLimit = 500;
+            var messageSize = 1024;
+
+            if (args.Length > 0)
+            {
+                var uri = args[0];
+                messageSize = int.Parse(args[1]);
+
+                AmqpUri = new Uri(uri);
+            }
+
+            Console.WriteLine($"{nameof(AmqpUri)}={AmqpUri}; {nameof(messageSize)}={messageSize}");
+
             var connectionFactory = new ConnectionFactory
             {
                 Uri = AmqpUri
             };
 
-            using (var connection = connectionFactory.CreateConnection())
-            using (var model = connection.CreateModel())
+            using (var connection1 = connectionFactory.CreateConnection())
+            using (var connection2 = connectionFactory.CreateConnection())
+            using (var connection3 = connectionFactory.CreateConnection())
             {
-                const ushort queueCount = 3;
-                const ushort queueSizeLimit = 100;
+                Console.WriteLine("Connected");
 
                 new Balancer(
-                    connection,
+                    connection1,
                     queueCount,
                     queueSizeLimit,
                     queueCount * queueSizeLimit * 2,
                     queueCount * queueSizeLimit * 2
                 ).Start();
+                Console.WriteLine("Balancer started");
 
                 for (var i = 0; i < queueCount; i++)
                 {
                     new Client(
-                        connection,
+                        connection2,
                         (ushort) (i + 1),
                         queueSizeLimit
                     ).Start();
+                    Console.WriteLine($"Client#{i + 1} started");
                 }
 
                 new Publisher(
-                    connection,
-                    1000,
-                    16 * 1024
+                    connection3,
+                    3000,
+                    messageSize
                 ).Start();
+                Console.WriteLine("Publisher started");
 
                 Console.ReadKey();
+
+                connection1.Close();
+                connection2.Close();
+                connection3.Close();
             }
         }
     }
