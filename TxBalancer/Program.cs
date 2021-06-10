@@ -1,228 +1,101 @@
 ﻿using System;
-using System.Collections.Concurrent;
-using System.Threading;
 using System.Threading.Tasks;
 using RabbitMQ.Client;
-using RabbitMQ.Client.Events;
 
 namespace TxBalancer
 {
     internal static class Program
     {
+        public static readonly Uri AmqpUri = new Uri("amqp://guest:guest@localhost:5672/");
         public static readonly string InputQueueName = "input";
         public static readonly string ResponseQueueName = "response";
         public static readonly Func<int, string> OutputQueueName = i => $"output_{i}";
         public static readonly Func<int, string> OutputMirrorQueueName = i => $"{OutputQueueName(i)}.mirror";
 
-        public static void Main(string[] args)
+        public static async Task Main()
         {
+            var connectionFactory = new ConnectionFactory
+            {
+                Uri = AmqpUri
+            };
+
+            using (var connection = connectionFactory.CreateConnection())
+            using (var model = connection.CreateModel())
+            {
+                const ushort queueCount = 3;
+                const ushort queueSizeLimit = 100;
+
+                new Balancer(
+                    connection,
+                    queueCount,
+                    queueSizeLimit,
+                    queueCount * queueSizeLimit * 2,
+                    queueCount * queueSizeLimit * 2
+                ).Start();
+
+                for (var i = 0; i < queueCount; i++)
+                {
+                    new Client(
+                        connection,
+                        (ushort) (i + 1),
+                        queueSizeLimit
+                    ).Start();
+                }
+
+                new Publisher(
+                    connection,
+                    1000,
+                    1024
+                ).Start();
+
+                Console.ReadKey();
+            }
         }
     }
 
-    internal class Balancer
+    internal class Publisher
     {
-        private readonly ConcurrentDictionary<string, ulong> _messageDeliveryTagByMessageId =
-            new ConcurrentDictionary<string, ulong>();
-
-        private readonly ConcurrentDictionary<string, ulong> _responseDeliveryTagByMessageId =
-            new ConcurrentDictionary<string, ulong>();
-
         private readonly IConnection _connection;
-        private readonly ushort _queueCount;
-        private readonly ushort _queueSizeLimit;
-        private readonly ushort _outputPrefetchCount;
-        private readonly ushort _inputPrefetchCount;
-        private IModel _outputModel;
-        private IModel _inputModel;
+        private readonly int _messageCountLimit;
+        private readonly int _messageSize;
+        private IModel _model;
 
-        public Balancer(IConnection connection, ushort queueCount, ushort queueSizeLimit, ushort outputPrefetchCount,
-            ushort inputPrefetchCount)
+        public Publisher(IConnection connection, int messageCountLimit, int messageSize)
         {
             _connection = connection;
-            _queueCount = queueCount;
-            _queueSizeLimit = queueSizeLimit;
-            _outputPrefetchCount = outputPrefetchCount;
-            _inputPrefetchCount = inputPrefetchCount;
+            _messageCountLimit = messageCountLimit;
+            _messageSize = messageSize;
         }
 
         public void Start()
         {
-            _outputModel = _connection.CreateModel();
-            _outputModel.BasicQos(0, _outputPrefetchCount, false);
-            _outputModel.TxSelect();
+            _model = _connection.CreateModel();
+            _model.TxSelect();
 
-            _inputModel = _connection.CreateModel();
-            _inputModel.BasicQos(0, _inputPrefetchCount, false);
-            _inputModel.TxSelect();
+            _model.QueueDeclare(Program.InputQueueName, true, false, false);
 
-            DeclareResources();
-
-            ConsumeMirrorQueues();
-            ConsumeResponseQueue();
-            ConsumeInputQueue();
-        }
-
-        private void DeclareResources()
-        {
-            DeclareAndPurgeQueue(Program.InputQueueName);
-            DeclareAndPurgeQueue(Program.ResponseQueueName);
-
-            for (var i = 0; i < _queueCount; i++)
+            Task.Run(() =>
             {
-                DeclareAndPurgeQueue(Program.OutputQueueName(i + 1));
-                DeclareAndPurgeQueue(Program.OutputMirrorQueueName(i + 1));
-            }
+                var messageCountToSend = _messageCountLimit;
 
-            void DeclareAndPurgeQueue(string queueName)
-            {
-                _outputModel.QueueDeclare(queueName, true, false, false);
-                _outputModel.QueuePurge(queueName);
-            }
-        }
-
-        private void ConsumeMirrorQueues()
-        {
-            for (var i = 0; i < _queueCount; i++)
-            {
-                var queueName = Program.OutputMirrorQueueName(i + 1);
-                var consumer = new EventingBasicConsumer(_outputModel);
-                consumer.Received += (_, args) =>
+                while (true)
                 {
-                    var messageId = args.BasicProperties.MessageId;
-                    var deliveryTag = args.DeliveryTag;
-
-                    if (_responseDeliveryTagByMessageId.TryRemove(messageId, out var responseDeliveryTag))
+                    if (messageCountToSend > 0)
                     {
-                        // TODO: ack 2 messages
-                        OnMessageProcessed();
-                        return;
+                        for (var i = 0; i < messageCountToSend; i++)
+                        {
+                            var properties = _model.CreateBasicProperties();
+                            properties.Persistent = true;
+                            _model.BasicPublish("", Program.InputQueueName, properties, new byte[_messageSize]);
+                        }
+
+                        _model.TxCommit();
                     }
 
-                    _messageDeliveryTagByMessageId.TryAdd(messageId, deliveryTag);
-                };
-                _outputModel.BasicConsume(consumer, queueName);
-            }
-        }
-
-        private void ConsumeResponseQueue()
-        {
-            var consumer = new EventingBasicConsumer(_outputModel);
-            consumer.Received += (_, args) =>
-            {
-                var messageId = args.BasicProperties.MessageId;
-                var deliveryTag = args.DeliveryTag;
-
-                if (_messageDeliveryTagByMessageId.TryRemove(messageId, out var messageDeliveryTag))
-                {
-                    // TODO: ack 2 messages
-                    OnMessageProcessed();
-                    return;
+                    messageCountToSend =
+                        _messageCountLimit - (int) _model.QueueDeclarePassive(Program.InputQueueName).MessageCount;
                 }
-
-                _responseDeliveryTagByMessageId.TryAdd(messageId, deliveryTag);
-            };
-            _outputModel.BasicConsume(consumer, Program.ResponseQueueName);
-        }
-
-        // private static readonly ConcurrentDictionary<IModel, Task> tasks =
-        //     new ConcurrentDictionary<IModel, Task>();
-        //
-        // private static readonly
-        //     ConcurrentDictionary<IModel, ConcurrentQueue<(Action<IModel>, TaskCompletionSource<bool>)>> actions =
-        //         new ConcurrentDictionary<IModel, ConcurrentQueue<(Action<IModel>, TaskCompletionSource<bool>)>>();
-        //
-        // private static Task InTransaction(IModel model, Action<IModel> action)
-        // {
-        //     if (tasks.TryGetValue(model, out var _))
-        //     {
-        //         var actionQueue = actions.GetOrAdd(model,
-        //             _ => new ConcurrentQueue<(Action<IModel>, TaskCompletionSource<bool>)>());
-        //         var tcs = new TaskCompletionSource<bool>();
-        //         actionQueue.Enqueue((action, tcs));
-        //         return tcs.Task;
-        //     }
-        //
-        //     var task = Task.Run(() =>
-        //     {
-        //         action(model);
-        //         model.TxCommit();
-        //     });
-        //     task.ContinueWith(async __ =>
-        //     {
-        //         tasks.TryRemove(model, out _);
-        //         if (actions.TryRemove(model, out var actionQueue))
-        //         {
-        //             await InTransaction(model, ___ =>
-        //             {
-        //                 foreach (var tuple in actionQueue)
-        //                 {
-        //                     tuple.Item1(model);
-        //                 }
-        //             });
-        //
-        //             while (actionQueue.TryDequeue(out var tuple))
-        //             {
-        //                 tuple.Item2.SetResult(true);
-        //             }
-        //         }
-        //     });
-        //     tasks.TryAdd(model, task);
-        //     return task;
-        // }
-
-        private void ConsumeInputQueue()
-        {
-            var consumer = new EventingBasicConsumer(_inputModel);
-            consumer.Received += (_, args) =>
-            {
-                var messageId = Guid.NewGuid().ToString("D");
-                var deliveryTag = args.DeliveryTag;
-                var outputQueueIndex = deliveryTag % _queueCount + 1;
-
-                var spinWait = new SpinWait();
-                while (_processingMessages >= _queueCount * _queueSizeLimit)
-                {
-                    spinWait.SpinOnce();
-                }
-
-                OnMessageProcessing();
-
-                // TODO: Ack + publish
-
-                // const messageId = generateMessageId();
-                // const deliveryTag = msg.fields.deliveryTag;
-                // const outputQueueIndex = deliveryTag % queueCount + 1;
-                //
-                // while (processingMessageCount >= queueCount * queueSizeLimit) {
-                //     await setTimeoutAsync(0);
-                // }
-                //
-                // onMessageProcessing();
-                //
-                // await txCommitSchedule(ch, () => {
-                //     ch.ack(msg);
-                //     ch.publish('', outputQueueName(outputQueueIndex), msg.content, {persistent: true, messageId});
-                //     ch.publish('', outputMirrorQueueName(outputQueueIndex), Buffer.from(''), {persistent: true, messageId});
-                // });
-            };
-            _inputModel.BasicConsume(consumer, Program.InputQueueName);
-        }
-
-        private volatile int _processingMessages;
-        private volatile int _processedMessages;
-
-        private void OnMessageProcessing()
-        {
-            Interlocked.Increment(ref _processingMessages);
-        }
-
-        private void OnMessageProcessed()
-        {
-            Interlocked.Decrement(ref _processingMessages);
-            if (Interlocked.Increment(ref _processedMessages) % 10000 == 0)
-            {
-                Console.WriteLine($"[Balancer] Processed {_processedMessages} messages");
-            }
+            });
         }
     }
 }
